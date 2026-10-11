@@ -70,14 +70,22 @@ func (x *MemcacheStorage) GetName() string {
 
 // Capabilities 声明 Memcache 存储支持的能力
 // Memcache 通过 Add + CompareAndSwap 提供 CAS，通过 NTP 提供可靠时间
-// 注意：Memcache 的 Delete 不支持条件删除，但通过 CAS 写删除标记+Delete 实现
-// AtomicDelete 语义（CAS 保证只有版本匹配的持有者能触发删除），声明此能力
+// 注意：不声明 CapabilityAtomicDelete。DeleteWithVersion 是"CAS 写删除标记 + 单独一次
+// Delete"两步操作，第二步 Delete 网络失败时会被忽略（见下），留下一个值为空、但 key 仍存在
+// 的幽灵记录：CreateWithVersion(Add) 会一直因 key 已存在而失败，且 core 因为存储声明了
+// AtomicDelete 而认为它应该已被真删除，不会走 UpdateWithVersion 抢占该记录——锁将永久卡死。
+// 不声明此能力后，core 走墓碑降级路径（UpdateWithVersion 写入 LockCount=0），与 Mongo/S3/
+// OBS 同构，不依赖 Delete 是否成功，配合 core 已修的 rlockReclaim/lockExpired 抢占逻辑安全。
 func (x *MemcacheStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
-		storage.CapabilityAtomicDelete,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *MemcacheStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *MemcacheStorage) Init(ctx context.Context) error {
@@ -156,10 +164,14 @@ func (x *MemcacheStorage) UpdateWithVersion(ctx context.Context, lockId string, 
 	key := x.lockKey(lockId)
 
 	// 获取当前值和 CasID
+	// 注意：这里 ErrCacheMiss 映射为 ErrVersionMiss（而不是 ErrLockNotFound）：调用方
+	// （如 lockExpired/rlockReclaim）只把 ErrVersionMiss 当作"抢占失败，可重试"，其它错误
+	// 会被当作硬错误直接返回给调用者，导致 Lock/RLock 在本该重试的场景下报错失败。
+	// Memcache 作为缓存而非数据库，key 可能因内存压力被驱逐，这个竞态窗口是真实存在的。
 	item, err := x.client.Get(key)
 	if err != nil {
 		if err == memcache.ErrCacheMiss {
-			return storage_lock.ErrLockNotFound
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
